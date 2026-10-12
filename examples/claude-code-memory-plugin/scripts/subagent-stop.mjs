@@ -21,7 +21,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { isPluginEnabled, loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
-import { extractCaptureTurns, parseTranscript } from "./cc-transcript.mjs";
+import { extractCaptureTurns } from "./cc-transcript.mjs";
 import {
   commitSession,
   deriveOvSessionId,
@@ -34,6 +34,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
 import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
 import { shapeCaptureParts } from "./shared/capture-utils.mjs";
+import { readJsonlRecords } from "./shared/jsonl-file.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -161,15 +162,14 @@ async function main() {
     const state = await loadState(subagentId);
     const ovSessionId = state?.ovSessionId || deriveOvSessionId(sessionId, `subagent:${subagentId}`);
 
-    let transcript;
+    let messages;
     try {
-      transcript = await readFile(transcriptPath, "utf-8");
+      messages = await readJsonlRecords(transcriptPath);
     } catch (err) {
       logError("transcript_read", err);
       return;
     }
 
-    const messages = parseTranscript(transcript);
     const turns = extractCaptureTurns(messages, cfg);
     log("transcript_parse", {
       subagentId,

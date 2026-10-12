@@ -24,7 +24,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { isPluginEnabled, loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
-import { extractCaptureTurns, parseTranscript, sanitizeCapturedText } from "./cc-transcript.mjs";
+import { extractCaptureTurns, sanitizeCapturedText } from "./cc-transcript.mjs";
 import {
   commitSession,
   deriveOvSessionId,
@@ -39,6 +39,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
 import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
 import { shapeCaptureParts } from "./shared/capture-utils.mjs";
+import { readJsonlRecords } from "./shared/jsonl-file.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -223,20 +224,19 @@ async function main({ cfg, input, cwd }) {
     return;
   }
 
-  let transcriptContent;
+  let messages;
   try {
-    transcriptContent = await readFile(transcriptPath, "utf-8");
+    messages = await readJsonlRecords(transcriptPath);
   } catch (err) {
     logError("transcript_read", err);
     return;
   }
 
-  if (!transcriptContent.trim()) {
+  if (messages.length === 0) {
     log("skip", { stage: "transcript_read", reason: "empty transcript" });
     return;
   }
 
-  const messages = parseTranscript(transcriptContent);
   const allTurns = extractCaptureTurns(messages, cfg);
   if (allTurns.length === 0) {
     log("skip", { stage: "transcript_parse", reason: "no user/assistant turns found" });

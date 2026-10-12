@@ -10,11 +10,11 @@
  * `session-state.mjs`, so it does not belong under `scripts/shared/`.
  */
 
-import { readFile } from "node:fs/promises";
 import { extractCaptureTranscript, findLastHumanTurnIndex } from "./capture-utils.mjs";
 import { CAPTURE_FORMAT_VERSION, resolveOvSessionId, saveState } from "./session-state.mjs";
 import { makeAgentFetchJSON } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
+import { readJsonlRecords } from "./shared/jsonl-file.mjs";
 
 /**
  * Build the `{ fetchJSONRes, fetchJSON }` pair used by every capture hook.
@@ -45,17 +45,15 @@ export function commitOvSession(fetchJSONRes, ovSessionId, body = {}) {
   });
 }
 
-function parseTranscript(content) {
-  try {
-    const data = JSON.parse(content);
-    if (Array.isArray(data)) return data;
-  } catch { /* not a JSON array */ }
-  const out = [];
-  for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* skip */ }
-  }
-  return out;
+// Rollout records nothing in capture-utils reads. A long thread re-records its
+// whole history on every compaction, so these are most of its bytes; dropping
+// them before JSON.parse keeps a multi-GB rollout readable. Codex writes
+// `timestamp` then `type` first; a line in any other shape is simply parsed.
+const UNCAPTURED_ROLLOUT_LINE =
+  /^\{"timestamp":"[^"]*","type":"(?:compacted|world_state|token_usage_record|event_msg","payload":\{"type":"token_count)"/;
+
+function isUncapturedRolloutLine(head) {
+  return UNCAPTURED_ROLLOUT_LINE.test(head);
 }
 
 /**
@@ -68,9 +66,9 @@ function parseTranscript(content) {
 export async function readTranscriptTurns(transcriptPath, cfg, logError) {
   if (!transcriptPath) return { turns: [], excludedLegacyTurnIndices: [], ok: false };
   try {
-    const raw = await readFile(transcriptPath, "utf-8");
-    if (!raw.trim()) return { turns: [], excludedLegacyTurnIndices: [], ok: true };
-    return { ...extractCaptureTranscript(parseTranscript(raw), cfg), ok: true };
+    const entries = await readJsonlRecords(transcriptPath, { skipLine: isUncapturedRolloutLine });
+    if (!entries.length) return { turns: [], excludedLegacyTurnIndices: [], ok: true };
+    return { ...extractCaptureTranscript(entries, cfg), ok: true };
   } catch (err) {
     logError?.("transcript_read", err);
     return { turns: [], excludedLegacyTurnIndices: [], ok: false };
