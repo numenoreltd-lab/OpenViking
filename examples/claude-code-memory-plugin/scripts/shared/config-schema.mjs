@@ -152,6 +152,9 @@ export const KNOBS = [
   { name: "captureTimeoutMs", type: "int", default: 0, min: 0, max: 600000, env: "OPENVIKING_CAPTURE_TIMEOUT_MS", capability: "capture" },
   { name: "commitTokenThreshold", type: "int", default: 20000, min: 1000, max: 1000000, env: "OPENVIKING_COMMIT_TOKEN_THRESHOLD", workspace: "capture.commit_token_threshold", capability: "capture" },
   { name: "commitKeepRecentCount", type: "int", default: 10, min: 0, max: 1000, env: "OPENVIKING_COMMIT_KEEP_RECENT_COUNT", capability: "capture" },
+  // 0 sends every turn past the cursor. A cursor far behind (lost state, a long outage, a transcript that was
+  // unreadable for days) otherwise replays that whole backlog in one commit, beyond what extraction can take.
+  { name: "captureCatchUpMaxTurns", type: "int", default: 0, min: 0, max: 1000000, env: "OPENVIKING_CAPTURE_CATCH_UP_MAX_TURNS", capability: "capture" },
   { name: "commitTurnThreshold", type: "int", default: 8, min: 1, max: 1000, env: "OPENVIKING_COMMIT_TURN_THRESHOLD", capability: "capture" },
   { name: "autoCommitOnCompact", type: "bool", default: true, env: "OPENVIKING_AUTO_COMMIT_ON_COMPACT", capability: "capture" },
   { name: "writePathAsync", type: "bool", default: true, env: "OPENVIKING_WRITE_PATH_ASYNC", capability: "capture" },

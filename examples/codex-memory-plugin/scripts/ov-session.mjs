@@ -149,6 +149,16 @@ export async function catchUpTurns({
     state.capturedTurnCount = Math.max(0, humanIndex);
   }
 
+  const maxCatchUp = Number(cfg?.captureCatchUpMaxTurns) || 0;
+  if (maxCatchUp > 0 && turns.length - state.capturedTurnCount > maxCatchUp) {
+    log?.("catch_up_capped", {
+      previouslyCaptured: state.capturedTurnCount,
+      skipped: turns.length - maxCatchUp - state.capturedTurnCount,
+      kept: maxCatchUp,
+    });
+    state.capturedTurnCount = turns.length - maxCatchUp;
+  }
+
   const newTurns = turns.slice(state.capturedTurnCount);
   log?.("transcript_parse", {
     totalTurns: turns.length,

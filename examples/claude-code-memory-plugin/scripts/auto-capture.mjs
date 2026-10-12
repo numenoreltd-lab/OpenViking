@@ -245,6 +245,15 @@ async function main({ cfg, input, cwd }) {
 
   const state = await loadState(sessionId);
   await reconcileKnownFailedCapture(cfg, sessionId, ovSessionId, state);
+  const maxCatchUp = Number(cfg.captureCatchUpMaxTurns) || 0;
+  if (maxCatchUp > 0 && allTurns.length - state.capturedTurnCount > maxCatchUp) {
+    log("catch_up_capped", {
+      previouslyCaptured: state.capturedTurnCount,
+      skipped: allTurns.length - maxCatchUp - state.capturedTurnCount,
+      kept: maxCatchUp,
+    });
+    state.capturedTurnCount = allTurns.length - maxCatchUp;
+  }
   const newTurns = allTurns.slice(state.capturedTurnCount);
   const captureTurns = cfg.captureAssistantTurns
     ? newTurns
