@@ -142,4 +142,47 @@ test("shortened transcript resumes at the latest human turn", async () => {
   assert.equal(state.capturedTurnCount, 2);
 });
 
+test("a grown rollout is read from the saved turn_context, not from the top", async () => {
+  const id = "cursor";
+  const sent = [];
+  const earlier = rollout(message("user", "First question"), message("assistant", "First answer"));
+  const turn2 = [
+    { type: "turn_context", payload: { turn_id: "turn-2", cwd: "/tmp/project" } },
+    message("user", "Second question"), message("assistant", "Second answer"),
+  ];
+  const path = await writeRollout(id, [...earlier, ...turn2]);
+  const first = await catchUp(id, path, sent);
+  assert.equal(first.result.added, 4);
+  const content = await readFile(path, "utf-8");
+  const offset = Buffer.byteLength(content.slice(0, content.indexOf('{"type":"turn_context","payload":{"turn_id":"turn-2"')));
+  assert.equal(first.state.transcriptCursor.offset, offset);
+  assert.equal(first.state.transcriptCursor.turnsBefore, 2);
+
+  // Blank out everything before the cursor: only a resumed read still finds
+  // the earlier turns where the cursor says they end.
+  await writeRollout(id, [...turn2, message("user", "Third question")]);
+  await writeFile(path, " ".repeat(offset - 1) + "\n" + (await readFile(path, "utf-8")));
+  const second = await catchUp(id, path, sent);
+  assert.equal(second.result.added, 1);
+  assert.deepEqual(sent.map((item) => item.parts[0].text),
+    ["First question", "First answer", "Second question", "Second answer", "Third question"]);
+  assert.equal(second.state.capturedTurnCount, 5);
+});
+
+test("the saved cursor never moves past a turn that failed to send", async () => {
+  const id = "cursor-failure";
+  const sent = [];
+  const path = await writeRollout(id, rollout(
+    message("user", "Retry me"),
+    { type: "turn_context", payload: { turn_id: "turn-2", cwd: "/tmp/project" } },
+    message("user", "And me"), message("assistant", "with a long enough tail for the cursor head"),
+  ));
+  const failed = await catchUp(id, path, sent, { fail: true });
+  assert.equal(failed.result.added, 0);
+  assert.equal((await loadState(id)).transcriptCursor, undefined);
+  assert.equal((await catchUp(id, path, sent)).result.added, 3);
+  assert.deepEqual(sent.map((item) => item.parts[0].text),
+    ["Retry me", "And me", "with a long enough tail for the cursor head"]);
+});
+
 test.after(async () => { await rm(stateDir, { recursive: true, force: true }); });

@@ -10,11 +10,11 @@
  * `session-state.mjs`, so it does not belong under `scripts/shared/`.
  */
 
-import { extractCaptureTranscript, findLastHumanTurnIndex } from "./capture-utils.mjs";
+import { extractCaptureTranscript } from "./capture-utils.mjs";
 import { CAPTURE_FORMAT_VERSION, resolveOvSessionId, saveState } from "./session-state.mjs";
 import { makeAgentFetchJSON } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
-import { readJsonlRecords } from "./shared/jsonl-file.mjs";
+import { readTurnsFromCursor } from "./shared/transcript-cursor.mjs";
 
 /**
  * Build the `{ fetchJSONRes, fetchJSON }` pair used by every capture hook.
@@ -59,19 +59,41 @@ function isUncapturedRolloutLine(head) {
 /**
  * Read and normalize the rollout at `transcriptPath`.
  *
+ * Resumes at `cursor` (a turn_context the last read saw) when the file still
+ * has it there, so a hook reads only what was appended since. Keeps the turns
+ * from index `keepFrom`, and with `keepLast` only that many of the newest.
+ *
+ * Returns `{ turns, totalTurns, lastHumanTurnIndex, cursor, readFrom, ok }`:
+ * `turns` are the last `turns.length` of `totalTurns`, indexes count the whole
+ * rollout, `cursor` is the newest turn_context, to pass back next time, and
+ * `readFrom` is the byte offset this read started at.
+ *
  * `ok` distinguishes "read it, it has N turns" from "could not read it".
  * Callers must not treat `ok: false` as a transcript shrink — resetting the
  * cursor on a transient read error replays the whole session.
  */
-export async function readTranscriptTurns(transcriptPath, cfg, logError) {
-  if (!transcriptPath) return { turns: [], excludedLegacyTurnIndices: [], ok: false };
+export async function readTranscriptTurns(transcriptPath, cfg, logError, { cursor, keepFrom = 0, keepLast = 0 } = {}) {
+  const failed = {
+    turns: [], totalTurns: 0, lastHumanTurnIndex: -1, excludedLegacyTurnIndices: [], cursor: null, readFrom: 0, ok: false,
+  };
+  if (!transcriptPath) return failed;
+  let excludedLegacyTurnIndices = [];
   try {
-    const entries = await readJsonlRecords(transcriptPath, { skipLine: isUncapturedRolloutLine });
-    if (!entries.length) return { turns: [], excludedLegacyTurnIndices: [], ok: true };
-    return { ...extractCaptureTranscript(entries, cfg), ok: true };
+    const read = await readTurnsFromCursor(transcriptPath, {
+      cursor, keepFrom, keepLast,
+      isBoundary: (record) => record?.type === "turn_context",
+      // Startup context sits before the first turn_context: only that piece has it.
+      extractTurns: (records, { first }) => {
+        const transcript = extractCaptureTranscript(records, cfg);
+        if (first) excludedLegacyTurnIndices = transcript.excludedLegacyTurnIndices;
+        return transcript.turns;
+      },
+      skipLine: isUncapturedRolloutLine,
+    });
+    return { ...read, excludedLegacyTurnIndices, ok: true };
   } catch (err) {
     logError?.("transcript_read", err);
-    return { turns: [], excludedLegacyTurnIndices: [], ok: false };
+    return failed;
   }
 }
 
@@ -83,6 +105,9 @@ export function hasCaptureKeyword(turns) {
 
 /**
  * Append every transcript turn past `state.capturedTurnCount`.
+ *
+ * `state.transcriptCursor` remembers where the rollout was last read up to, so
+ * the next run reads only what was appended (see readTranscriptTurns).
  *
  * Advances the cursor (and persists it) after each durably sent batch, so a
  * failure halfway through never replays what already landed. Mutates `state`;
@@ -111,9 +136,18 @@ export async function catchUpTurns({
   // a session whose Stop/SessionEnd workers never ran.
   if (transcriptPath) state.transcriptPath = transcriptPath;
 
-  const { turns, excludedLegacyTurnIndices, ok } = await readTranscriptTurns(transcriptPath, cfg, logError);
+  const maxCatchUp = Number(cfg?.captureCatchUpMaxTurns) || 0;
+  // A cursor counts turns in the current capture format; an older state reads
+  // from the top so the migration below sees the startup context.
+  const current = state.captureFormatVersion === CAPTURE_FORMAT_VERSION;
+  let read = await readTranscriptTurns(transcriptPath, cfg, logError, {
+    cursor: current ? state.transcriptCursor : null,
+    keepFrom: current ? state.capturedTurnCount : 0,
+    keepLast: maxCatchUp,
+  });
+  const { excludedLegacyTurnIndices, ok } = read;
 
-  if (ok && state.captureFormatVersion !== CAPTURE_FORMAT_VERSION) {
+  if (ok && !current) {
     const oldCursor = Math.max(0, Number(state.capturedTurnCount) || 0);
     state.capturedTurnCount = oldCursor - excludedLegacyTurnIndices.filter((index) => index < oldCursor).length;
     state.captureFormatVersion = CAPTURE_FORMAT_VERSION;
@@ -127,7 +161,7 @@ export async function catchUpTurns({
     });
   }
 
-  if (!ok || turns.length === 0) {
+  if (!ok || read.totalTurns === 0) {
     log?.("transcript_empty", {
       readable: ok,
       previouslyCaptured: state.capturedTurnCount,
@@ -138,34 +172,53 @@ export async function catchUpTurns({
   // Post-compact transcript-shrink defense: codex's /compact may rewrite or
   // truncate transcript_path. Resume at the latest human turn so the current
   // interaction is captured without replaying compacted history.
-  if (turns.length < state.capturedTurnCount) {
-    const humanIndex = findLastHumanTurnIndex(turns);
+  if (read.totalTurns < state.capturedTurnCount) {
+    const humanIndex = read.lastHumanTurnIndex;
     log?.("transcript_shrink_detected", {
       cached: state.capturedTurnCount,
-      observed: turns.length,
+      observed: read.totalTurns,
       resumeFrom: Math.max(0, humanIndex),
       fallback: humanIndex < 0 ? "full_transcript" : undefined,
     });
     state.capturedTurnCount = Math.max(0, humanIndex);
+    // The read kept only turns past the old cursor; read again for these.
+    read = await readTranscriptTurns(transcriptPath, cfg, logError, {
+      keepFrom: state.capturedTurnCount,
+      keepLast: maxCatchUp,
+    });
+    if (!read.ok) return { newTurns: [], added: 0, ovSessionId: "", unreadable: true };
   }
 
-  const maxCatchUp = Number(cfg?.captureCatchUpMaxTurns) || 0;
-  if (maxCatchUp > 0 && turns.length - state.capturedTurnCount > maxCatchUp) {
+  const { turns, totalTurns } = read;
+  if (maxCatchUp > 0 && totalTurns - state.capturedTurnCount > maxCatchUp) {
     log?.("catch_up_capped", {
       previouslyCaptured: state.capturedTurnCount,
-      skipped: turns.length - maxCatchUp - state.capturedTurnCount,
+      skipped: totalTurns - maxCatchUp - state.capturedTurnCount,
       kept: maxCatchUp,
     });
-    state.capturedTurnCount = turns.length - maxCatchUp;
+    state.capturedTurnCount = totalTurns - maxCatchUp;
   }
 
-  const newTurns = turns.slice(state.capturedTurnCount);
+  // Move the saved cursor up to the newest turn_context once every turn before
+  // it is captured, never past a turn still to send.
+  const advanceCursor = () => {
+    if (!read.cursor || state.capturedTurnCount < read.cursor.turnsBefore) return false;
+    if (state.transcriptCursor?.offset === read.cursor.offset) return false;
+    state.transcriptCursor = read.cursor;
+    return true;
+  };
+
+  const newTurns = turns.slice(Math.max(0, state.capturedTurnCount - (totalTurns - turns.length)));
   log?.("transcript_parse", {
-    totalTurns: turns.length,
+    totalTurns,
     previouslyCaptured: state.capturedTurnCount,
     newTurns: newTurns.length,
+    readFrom: read.readFrom,
   });
-  if (newTurns.length === 0) return { newTurns, added: 0, ovSessionId: "" };
+  if (newTurns.length === 0) {
+    if (advanceCursor()) await saveState(state, { touch: false });
+    return { newTurns, added: 0, ovSessionId: "" };
+  }
 
   if (shouldSend && !shouldSend(newTurns)) {
     log?.("skip", { stage: "capture_mode", reason: "keyword mode without capture trigger" });
@@ -193,6 +246,7 @@ export async function catchUpTurns({
     // catch-up. Queueing the same tail would create a second retry owner.
     onSent: async (n) => {
       state.capturedTurnCount += n;
+      advanceCursor();
       await saveState(state);
       await heartbeat?.();
     },

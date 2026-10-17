@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { readJsonlRecords } from "./lib/jsonl-file.mjs";
+import { forEachJsonlRecord, readJsonlRecords } from "./lib/jsonl-file.mjs";
 
 // What the hooks did before: the whole file as one string, split on newlines.
 function wholeFileParse(content) {
@@ -81,4 +81,23 @@ test("an empty or blank file yields no records", async () => {
 
 test("a missing file rejects so the caller can log transcript_read", async () => {
   await assert.rejects(readJsonlRecords(join(tmpdir(), "ov-jsonl-file-missing", "nope.jsonl")), { code: "ENOENT" });
+});
+
+test("forEachJsonlRecord reports each record's bytes and resumes from a saved offset", async () => {
+  await withFile(SAMPLE, async (path) => {
+    const bytes = Buffer.from(SAMPLE);
+    for (const chunkBytes of [1, 3, 64, 1 << 20]) {
+      const seen = [];
+      await forEachJsonlRecord(path, (record, offset, end) => seen.push({ record, offset, end }), { chunkBytes });
+      assert.deepEqual(seen.map((s) => s.record), wholeFileParse(SAMPLE), `chunkBytes=${chunkBytes}`);
+      for (const { record, offset, end } of seen) {
+        assert.deepEqual(JSON.parse(bytes.toString("utf8", offset, end)), record);
+      }
+      for (const [i, { offset }] of seen.entries()) {
+        const rest = [];
+        await forEachJsonlRecord(path, (record) => rest.push(record), { start: offset, chunkBytes });
+        assert.deepEqual(rest, seen.slice(i).map((s) => s.record), `start=${offset} chunkBytes=${chunkBytes}`);
+      }
+    }
+  });
 });

@@ -126,6 +126,60 @@ test("failed non-retryable capture keeps the cursor for a later retry", async ()
   }
 });
 
+test("a grown transcript is read from the saved prompt, not from the top", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ov-cc-capture-cursor-"));
+  const transcriptPath = join(root, "transcript.jsonl");
+  const sessionId = "capture-cursor";
+  const batches = [];
+  const record = (type, content) => JSON.stringify({ type, message: { role: type, content }, uuid: `${type}-${content}` });
+  const turn2 = [record("user", "Second question"), record("assistant", "Second answer")];
+
+  try {
+    await writeFile(transcriptPath, [
+      record("user", "First question"), record("assistant", "First answer"), ...turn2,
+    ].join("\n") + "\n");
+    await withMockOpenViking(async (req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") {
+        writeJson(res, { status: "ok", result: { healthy: true } });
+        return;
+      }
+      if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
+        const body = await readRequestBody(req);
+        batches.push(body);
+        writeJson(res, { status: "ok", result: { added: body.messages.length } });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === `/api/v1/sessions/cc-${sessionId}`) {
+        writeJson(res, { status: "ok", result: { message_count: 4, pending_tokens: 10, commit_count: 0 } });
+        return;
+      }
+      writeJson(res, { status: "error", error: { code: "NOT_FOUND" } }, 404);
+    }, async (baseUrl) => {
+      const input = { session_id: sessionId, transcript_path: transcriptPath, cwd: root };
+      await runAutoCapture(input, hookEnv(root, baseUrl));
+      const statePath = join(root, "openviking-cc-capture-state", `${sessionId}.json`);
+      const first = JSON.parse(await readFile(statePath, "utf-8"));
+      const content = await readFile(transcriptPath, "utf-8");
+      const offset = Buffer.byteLength(content.slice(0, content.indexOf(turn2[0])));
+      assert.equal(first.transcriptCursor.offset, offset);
+      assert.equal(first.transcriptCursor.turnsBefore, 2);
+
+      // Blank out everything before the cursor: only a resumed read still
+      // counts the earlier turns.
+      await writeFile(transcriptPath, " ".repeat(offset - 1) + "\n"
+        + [...turn2, record("user", "Third question")].join("\n") + "\n");
+      await runAutoCapture(input, hookEnv(root, baseUrl));
+      assert.equal(JSON.parse(await readFile(statePath, "utf-8")).capturedTurnCount, 5);
+    });
+
+    assert.deepEqual(batches.map((batch) => batch.messages.length), [4, 1]);
+    assert.equal(JSON.stringify(batches[1].messages).includes("Third question"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("threshold commit archives every captured message", async () => {
   const root = await mkdtemp(join(tmpdir(), "ov-cc-capture-commit-"));
   const transcriptPath = join(root, "transcript.jsonl");

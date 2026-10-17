@@ -124,6 +124,18 @@ function textFromParts(parts) {
 }
 
 /**
+ * A prompt the user typed: a user record that is not a tool result. Each one
+ * starts a turn whose tool calls and results all follow it, so a transcript can
+ * be cut before it and the pieces turned into turns separately.
+ */
+export function isPromptRecord(record) {
+  if (record?.type !== "user" || record.isSidechain) return false;
+  const content = record.message?.content;
+  if (typeof content === "string") return true;
+  return Array.isArray(content) && !content.some((block) => block?.type === "tool_result");
+}
+
+/**
  * Every user/assistant turn in the transcript, in order.
  *
  * Turns carrying no structured part are dropped; the rest keep their index, so

@@ -13,7 +13,8 @@
  * This preserves cross-turn context for the memory extractor, produces archives
  * naturally, and lets resume / PreCompact / SessionEnd reuse the same session.
  *
- * Incremental tracking: state file per CC session_id records capturedTurnCount.
+ * Incremental tracking: state file per CC session_id records capturedTurnCount,
+ * and transcriptCursor, where the next run starts reading the transcript.
  *
  * Ported from openclaw-plugin/ context-engine.ts + text-utils.ts
  * (MEMORY_TRIGGERS / extractNewTurnMessages).
@@ -24,7 +25,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { isPluginEnabled, loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
-import { extractCaptureTurns, sanitizeCapturedText } from "./cc-transcript.mjs";
+import { extractCaptureTurns, isPromptRecord, sanitizeCapturedText } from "./cc-transcript.mjs";
 import {
   commitSession,
   deriveOvSessionId,
@@ -39,7 +40,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
 import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
 import { shapeCaptureParts } from "./shared/capture-utils.mjs";
-import { readJsonlRecords } from "./shared/jsonl-file.mjs";
+import { readTurnsFromCursor } from "./shared/transcript-cursor.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -224,42 +225,48 @@ async function main({ cfg, input, cwd }) {
     return;
   }
 
-  let messages;
+  const state = await loadState(sessionId);
+  await reconcileKnownFailedCapture(cfg, sessionId, ovSessionId, state);
+  const maxCatchUp = Number(cfg.captureCatchUpMaxTurns) || 0;
+
+  let read;
   try {
-    messages = await readJsonlRecords(transcriptPath);
+    read = await readTurnsFromCursor(transcriptPath, {
+      cursor: state.transcriptCursor,
+      keepFrom: state.capturedTurnCount,
+      keepLast: maxCatchUp,
+      isBoundary: isPromptRecord,
+      extractTurns: (records) => extractCaptureTurns(records, cfg),
+    });
   } catch (err) {
     logError("transcript_read", err);
     return;
   }
 
-  if (messages.length === 0) {
-    log("skip", { stage: "transcript_read", reason: "empty transcript" });
-    return;
-  }
-
-  const allTurns = extractCaptureTurns(messages, cfg);
-  if (allTurns.length === 0) {
+  const { turns, totalTurns } = read;
+  if (totalTurns === 0) {
     log("skip", { stage: "transcript_parse", reason: "no user/assistant turns found" });
     return;
   }
 
-  const state = await loadState(sessionId);
-  await reconcileKnownFailedCapture(cfg, sessionId, ovSessionId, state);
-  const maxCatchUp = Number(cfg.captureCatchUpMaxTurns) || 0;
-  if (maxCatchUp > 0 && allTurns.length - state.capturedTurnCount > maxCatchUp) {
+  if (maxCatchUp > 0 && totalTurns - state.capturedTurnCount > maxCatchUp) {
     log("catch_up_capped", {
       previouslyCaptured: state.capturedTurnCount,
-      skipped: allTurns.length - maxCatchUp - state.capturedTurnCount,
+      skipped: totalTurns - maxCatchUp - state.capturedTurnCount,
       kept: maxCatchUp,
     });
-    state.capturedTurnCount = allTurns.length - maxCatchUp;
+    state.capturedTurnCount = totalTurns - maxCatchUp;
   }
-  const newTurns = allTurns.slice(state.capturedTurnCount);
+  // Every turn sent (or deliberately skipped): the next run reads from the
+  // newest prompt on.
+  const caughtUp = () => ({ ...state, capturedTurnCount: totalTurns, transcriptCursor: read.cursor });
+  const newTurns = turns.slice(Math.max(0, state.capturedTurnCount - (totalTurns - turns.length)));
   const captureTurns = cfg.captureAssistantTurns
     ? newTurns
     : newTurns.filter(turn => turn.role === "user");
   log("transcript_parse", {
-    totalTurns: allTurns.length,
+    totalTurns,
+    readFrom: read.readFrom,
     previouslyCaptured: state.capturedTurnCount,
     newTurns: newTurns.length,
     captureTurns: captureTurns.length,
@@ -272,11 +279,8 @@ async function main({ cfg, input, cwd }) {
   }
 
   if (captureTurns.length === 0) {
-    await saveState(sessionId, {
-      ...state,
-      capturedTurnCount: allTurns.length,
-    });
-    log("state_update", { newCapturedTurnCount: allTurns.length, reason: "assistant_only_increment" });
+    await saveState(sessionId, caughtUp());
+    log("state_update", { newCapturedTurnCount: totalTurns, reason: "assistant_only_increment" });
     return;
   }
 
@@ -294,10 +298,7 @@ async function main({ cfg, input, cwd }) {
   const combined = formatTurnsAsText(captureTurns);
   if (!sanitizeCapturedText(combined)) {
     log("skip", { stage: "batch_empty" });
-    await saveState(sessionId, {
-      ...state,
-      capturedTurnCount: allTurns.length,
-    });
+    await saveState(sessionId, caughtUp());
     return;
   }
 
@@ -309,10 +310,7 @@ async function main({ cfg, input, cwd }) {
     );
     if (!hasTrigger) {
       log("skip", { stage: "keyword_mode_no_trigger", turns: captureTurns.length });
-      await saveState(sessionId, {
-        ...state,
-        capturedTurnCount: allTurns.length,
-      });
+      await saveState(sessionId, caughtUp());
       return;
     }
   }
@@ -340,11 +338,8 @@ async function main({ cfg, input, cwd }) {
       logError("pending_enqueue", "some turns failed to enqueue; state not advanced");
       return;
     }
-    await saveState(sessionId, {
-      ...state,
-      capturedTurnCount: allTurns.length,
-    });
-    log("state_update", { newCapturedTurnCount: allTurns.length, reason: "pending_queued" });
+    await saveState(sessionId, caughtUp());
+    log("state_update", { newCapturedTurnCount: totalTurns, reason: "pending_queued" });
     writeJsonState("last-capture.json", {
       turns_captured: 0,
       turns_queued: result.queued,
@@ -398,11 +393,8 @@ async function main({ cfg, input, cwd }) {
   // A missing live-message file is recoverable after the server is fixed, so
   // retain the cursor for that failure. Other non-retryable 4xx responses keep
   // the historical terminal behavior instead of retrying invalid payloads.
-  await saveState(sessionId, {
-    ...state,
-    capturedTurnCount: allTurns.length,
-  });
-  log("state_update", { newCapturedTurnCount: allTurns.length });
+  await saveState(sessionId, caughtUp());
+  log("state_update", { newCapturedTurnCount: totalTurns });
 
   // Client-driven commit (ported from openclaw-plugin/context-engine.ts:afterTurn).
   // OV's Session._auto_commit_threshold is not consumed by addMessage, so we
