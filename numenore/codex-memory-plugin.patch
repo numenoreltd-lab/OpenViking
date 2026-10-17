@@ -1,0 +1,513 @@
+diff --git a/scripts/ov-session.mjs b/scripts/ov-session.mjs
+index e762c944..2736ddf3 100644
+--- a/scripts/ov-session.mjs
++++ b/scripts/ov-session.mjs
+@@ -10,11 +10,11 @@
+  * `session-state.mjs`, so it does not belong under `scripts/shared/`.
+  */
+ 
+-import { readFile } from "node:fs/promises";
+-import { extractCaptureTranscript, findLastHumanTurnIndex } from "./capture-utils.mjs";
++import { extractCaptureTranscript } from "./capture-utils.mjs";
+ import { CAPTURE_FORMAT_VERSION, resolveOvSessionId, saveState } from "./session-state.mjs";
+ import { makeAgentFetchJSON } from "./shared/agent-hook-runtime.mjs";
+ import { sendSessionMessages } from "./shared/batch-send.mjs";
++import { readTurnsFromCursor } from "./shared/transcript-cursor.mjs";
+ 
+ /**
+  * Build the `{ fetchJSONRes, fetchJSON }` pair used by every capture hook.
+@@ -45,35 +45,55 @@ export function commitOvSession(fetchJSONRes, ovSessionId, body = {}) {
+   });
+ }
+ 
+-function parseTranscript(content) {
+-  try {
+-    const data = JSON.parse(content);
+-    if (Array.isArray(data)) return data;
+-  } catch { /* not a JSON array */ }
+-  const out = [];
+-  for (const line of content.split("\n")) {
+-    if (!line.trim()) continue;
+-    try { out.push(JSON.parse(line)); } catch { /* skip */ }
+-  }
+-  return out;
++// Rollout records nothing in capture-utils reads. A long thread re-records its
++// whole history on every compaction, so these are most of its bytes; dropping
++// them before JSON.parse keeps a multi-GB rollout readable. Codex writes
++// `timestamp` then `type` first; a line in any other shape is simply parsed.
++const UNCAPTURED_ROLLOUT_LINE =
++  /^\{"timestamp":"[^"]*","type":"(?:compacted|world_state|token_usage_record|event_msg","payload":\{"type":"token_count)"/;
++
++function isUncapturedRolloutLine(head) {
++  return UNCAPTURED_ROLLOUT_LINE.test(head);
+ }
+ 
+ /**
+  * Read and normalize the rollout at `transcriptPath`.
+  *
++ * Resumes at `cursor` (a turn_context the last read saw) when the file still
++ * has it there, so a hook reads only what was appended since. Keeps the turns
++ * from index `keepFrom`, and with `keepLast` only that many of the newest.
++ *
++ * Returns `{ turns, totalTurns, lastHumanTurnIndex, cursor, readFrom, ok }`:
++ * `turns` are the last `turns.length` of `totalTurns`, indexes count the whole
++ * rollout, `cursor` is the newest turn_context, to pass back next time, and
++ * `readFrom` is the byte offset this read started at.
++ *
+  * `ok` distinguishes "read it, it has N turns" from "could not read it".
+  * Callers must not treat `ok: false` as a transcript shrink — resetting the
+  * cursor on a transient read error replays the whole session.
+  */
+-export async function readTranscriptTurns(transcriptPath, cfg, logError) {
+-  if (!transcriptPath) return { turns: [], excludedLegacyTurnIndices: [], ok: false };
++export async function readTranscriptTurns(transcriptPath, cfg, logError, { cursor, keepFrom = 0, keepLast = 0 } = {}) {
++  const failed = {
++    turns: [], totalTurns: 0, lastHumanTurnIndex: -1, excludedLegacyTurnIndices: [], cursor: null, readFrom: 0, ok: false,
++  };
++  if (!transcriptPath) return failed;
++  let excludedLegacyTurnIndices = [];
+   try {
+-    const raw = await readFile(transcriptPath, "utf-8");
+-    if (!raw.trim()) return { turns: [], excludedLegacyTurnIndices: [], ok: true };
+-    return { ...extractCaptureTranscript(parseTranscript(raw), cfg), ok: true };
++    const read = await readTurnsFromCursor(transcriptPath, {
++      cursor, keepFrom, keepLast,
++      isBoundary: (record) => record?.type === "turn_context",
++      // Startup context sits before the first turn_context: only that piece has it.
++      extractTurns: (records, { first }) => {
++        const transcript = extractCaptureTranscript(records, cfg);
++        if (first) excludedLegacyTurnIndices = transcript.excludedLegacyTurnIndices;
++        return transcript.turns;
++      },
++      skipLine: isUncapturedRolloutLine,
++    });
++    return { ...read, excludedLegacyTurnIndices, ok: true };
+   } catch (err) {
+     logError?.("transcript_read", err);
+-    return { turns: [], excludedLegacyTurnIndices: [], ok: false };
++    return failed;
+   }
+ }
+ 
+@@ -86,6 +106,9 @@ export function hasCaptureKeyword(turns) {
+ /**
+  * Append every transcript turn past `state.capturedTurnCount`.
+  *
++ * `state.transcriptCursor` remembers where the rollout was last read up to, so
++ * the next run reads only what was appended (see readTranscriptTurns).
++ *
+  * Advances the cursor (and persists it) after each durably sent batch, so a
+  * failure halfway through never replays what already landed. Mutates `state`;
+  * the caller owns the session lock.
+@@ -113,9 +136,18 @@ export async function catchUpTurns({
+   // a session whose Stop/SessionEnd workers never ran.
+   if (transcriptPath) state.transcriptPath = transcriptPath;
+ 
+-  const { turns, excludedLegacyTurnIndices, ok } = await readTranscriptTurns(transcriptPath, cfg, logError);
++  const maxCatchUp = Number(cfg?.captureCatchUpMaxTurns) || 0;
++  // A cursor counts turns in the current capture format; an older state reads
++  // from the top so the migration below sees the startup context.
++  const current = state.captureFormatVersion === CAPTURE_FORMAT_VERSION;
++  let read = await readTranscriptTurns(transcriptPath, cfg, logError, {
++    cursor: current ? state.transcriptCursor : null,
++    keepFrom: current ? state.capturedTurnCount : 0,
++    keepLast: maxCatchUp,
++  });
++  const { excludedLegacyTurnIndices, ok } = read;
+ 
+-  if (ok && state.captureFormatVersion !== CAPTURE_FORMAT_VERSION) {
++  if (ok && !current) {
+     const oldCursor = Math.max(0, Number(state.capturedTurnCount) || 0);
+     state.capturedTurnCount = oldCursor - excludedLegacyTurnIndices.filter((index) => index < oldCursor).length;
+     state.captureFormatVersion = CAPTURE_FORMAT_VERSION;
+@@ -129,7 +161,7 @@ export async function catchUpTurns({
+     });
+   }
+ 
+-  if (!ok || turns.length === 0) {
++  if (!ok || read.totalTurns === 0) {
+     log?.("transcript_empty", {
+       readable: ok,
+       previouslyCaptured: state.capturedTurnCount,
+@@ -140,24 +172,53 @@ export async function catchUpTurns({
+   // Post-compact transcript-shrink defense: codex's /compact may rewrite or
+   // truncate transcript_path. Resume at the latest human turn so the current
+   // interaction is captured without replaying compacted history.
+-  if (turns.length < state.capturedTurnCount) {
+-    const humanIndex = findLastHumanTurnIndex(turns);
++  if (read.totalTurns < state.capturedTurnCount) {
++    const humanIndex = read.lastHumanTurnIndex;
+     log?.("transcript_shrink_detected", {
+       cached: state.capturedTurnCount,
+-      observed: turns.length,
++      observed: read.totalTurns,
+       resumeFrom: Math.max(0, humanIndex),
+       fallback: humanIndex < 0 ? "full_transcript" : undefined,
+     });
+     state.capturedTurnCount = Math.max(0, humanIndex);
++    // The read kept only turns past the old cursor; read again for these.
++    read = await readTranscriptTurns(transcriptPath, cfg, logError, {
++      keepFrom: state.capturedTurnCount,
++      keepLast: maxCatchUp,
++    });
++    if (!read.ok) return { newTurns: [], added: 0, ovSessionId: "", unreadable: true };
++  }
++
++  const { turns, totalTurns } = read;
++  if (maxCatchUp > 0 && totalTurns - state.capturedTurnCount > maxCatchUp) {
++    log?.("catch_up_capped", {
++      previouslyCaptured: state.capturedTurnCount,
++      skipped: totalTurns - maxCatchUp - state.capturedTurnCount,
++      kept: maxCatchUp,
++    });
++    state.capturedTurnCount = totalTurns - maxCatchUp;
+   }
+ 
+-  const newTurns = turns.slice(state.capturedTurnCount);
++  // Move the saved cursor up to the newest turn_context once every turn before
++  // it is captured, never past a turn still to send.
++  const advanceCursor = () => {
++    if (!read.cursor || state.capturedTurnCount < read.cursor.turnsBefore) return false;
++    if (state.transcriptCursor?.offset === read.cursor.offset) return false;
++    state.transcriptCursor = read.cursor;
++    return true;
++  };
++
++  const newTurns = turns.slice(Math.max(0, state.capturedTurnCount - (totalTurns - turns.length)));
+   log?.("transcript_parse", {
+-    totalTurns: turns.length,
++    totalTurns,
+     previouslyCaptured: state.capturedTurnCount,
+     newTurns: newTurns.length,
++    readFrom: read.readFrom,
+   });
+-  if (newTurns.length === 0) return { newTurns, added: 0, ovSessionId: "" };
++  if (newTurns.length === 0) {
++    if (advanceCursor()) await saveState(state, { touch: false });
++    return { newTurns, added: 0, ovSessionId: "" };
++  }
+ 
+   if (shouldSend && !shouldSend(newTurns)) {
+     log?.("skip", { stage: "capture_mode", reason: "keyword mode without capture trigger" });
+@@ -185,6 +246,7 @@ export async function catchUpTurns({
+     // catch-up. Queueing the same tail would create a second retry owner.
+     onSent: async (n) => {
+       state.capturedTurnCount += n;
++      advanceCursor();
+       await saveState(state);
+       await heartbeat?.();
+     },
+diff --git a/scripts/shared/config-schema.mjs b/scripts/shared/config-schema.mjs
+index c79d4f11..da67e999 100644
+--- a/scripts/shared/config-schema.mjs
++++ b/scripts/shared/config-schema.mjs
+@@ -152,6 +152,9 @@ export const KNOBS = [
+   { name: "captureTimeoutMs", type: "int", default: 0, min: 0, max: 600000, env: "OPENVIKING_CAPTURE_TIMEOUT_MS", capability: "capture" },
+   { name: "commitTokenThreshold", type: "int", default: 20000, min: 1000, max: 1000000, env: "OPENVIKING_COMMIT_TOKEN_THRESHOLD", workspace: "capture.commit_token_threshold", capability: "capture" },
+   { name: "commitKeepRecentCount", type: "int", default: 10, min: 0, max: 1000, env: "OPENVIKING_COMMIT_KEEP_RECENT_COUNT", capability: "capture" },
++  // 0 sends every turn past the cursor. A cursor far behind (lost state, a long outage, a transcript that was
++  // unreadable for days) otherwise replays that whole backlog in one commit, beyond what extraction can take.
++  { name: "captureCatchUpMaxTurns", type: "int", default: 0, min: 0, max: 1000000, env: "OPENVIKING_CAPTURE_CATCH_UP_MAX_TURNS", capability: "capture" },
+   { name: "commitTurnThreshold", type: "int", default: 8, min: 1, max: 1000, env: "OPENVIKING_COMMIT_TURN_THRESHOLD", capability: "capture" },
+   { name: "autoCommitOnCompact", type: "bool", default: true, env: "OPENVIKING_AUTO_COMMIT_ON_COMPACT", capability: "capture" },
+   { name: "writePathAsync", type: "bool", default: true, env: "OPENVIKING_WRITE_PATH_ASYNC", capability: "capture" },
+diff --git a/scripts/shared/jsonl-file.mjs b/scripts/shared/jsonl-file.mjs
+new file mode 100644
+index 00000000..f29fe163
+--- /dev/null
++++ b/scripts/shared/jsonl-file.mjs
+@@ -0,0 +1,133 @@
++// GENERATED FROM examples/memory-plugin-shared/lib. DO NOT EDIT.
++/**
++ * Read a JSONL transcript record by record.
++ *
++ * Hosts append to one transcript for the whole life of a thread, and a long
++ * one passes V8's string limit (~512 MB): `readFile(path, "utf-8")` then throws
++ * `Invalid string length` on every hook, and nothing more of that thread is
++ * captured. Reading in chunks and decoding one line at a time keeps memory to
++ * what the records themselves take.
++ *
++ * `skipLine(head)` sees the first bytes of a line and can drop it before it is
++ * parsed — for record types a caller never reads, which in a long Codex rollout
++ * are most of the file.
++ */
++
++import { open } from "node:fs/promises";
++
++const CHUNK_BYTES = 16 * 1024 * 1024;
++const HEAD_BYTES = 256;
++const NEWLINE = 0x0a;
++
++/**
++ * Returns what `content.split("\n").map(JSON.parse)` would, skipping blank and
++ * unparseable lines. A file that is one JSON array (older Claude transcripts)
++ * is read whole, as before.
++ */
++export async function readJsonlRecords(path, { skipLine, chunkBytes = CHUNK_BYTES } = {}) {
++  const file = await open(path, "r");
++  try {
++    if (await firstByteIs(file, 0x5b /* "[" */)) return await readJsonArray(file);
++    const records = [];
++    await scanLines(file, 0, (record) => records.push(record), skipLine, chunkBytes);
++    return records;
++  } finally {
++    await file.close();
++  }
++}
++
++/**
++ * Call `onRecord(record, offset, end)` for each record from byte `start` on;
++ * `[offset, end)` are the record's bytes in the file. Holding no records
++ * itself, it lets a caller keep only what it needs, and a caller that saves an
++ * `offset` can later resume there instead of reading the file from the top.
++ */
++export async function forEachJsonlRecord(path, onRecord, { start = 0, skipLine, chunkBytes = CHUNK_BYTES } = {}) {
++  const file = await open(path, "r");
++  try {
++    await scanLines(file, start, onRecord, skipLine, chunkBytes);
++  } finally {
++    await file.close();
++  }
++}
++
++/** Whether the file is one JSON array rather than JSONL. */
++export async function startsWithJsonArray(path) {
++  const file = await open(path, "r");
++  try {
++    return await firstByteIs(file, 0x5b /* "[" */);
++  } finally {
++    await file.close();
++  }
++}
++
++/** Up to `length` bytes of the file from `offset`, or null if it cannot be read. */
++export async function readBytesAt(path, offset, length) {
++  let file;
++  try {
++    file = await open(path, "r");
++    const buf = Buffer.alloc(length);
++    const { bytesRead } = await file.read(buf, 0, length, offset);
++    return buf.subarray(0, bytesRead);
++  } catch {
++    return null;
++  } finally {
++    await file?.close();
++  }
++}
++
++async function scanLines(file, start, onRecord, skipLine, chunkBytes) {
++  const chunk = Buffer.alloc(chunkBytes);
++  let carry = null;
++  let position = start;
++  for (;;) {
++    const { bytesRead } = await file.read(chunk, 0, chunk.length, position);
++    if (bytesRead === 0) break;
++    const base = position - (carry ? carry.length : 0);
++    position += bytesRead;
++    const buf = carry ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead);
++    let lineStart = 0;
++    for (let nl = buf.indexOf(NEWLINE); nl !== -1; nl = buf.indexOf(NEWLINE, lineStart)) {
++      emitRecord(buf, lineStart, nl, base, onRecord, skipLine);
++      lineStart = nl + 1;
++    }
++    carry = lineStart < buf.length ? Buffer.from(buf.subarray(lineStart)) : null;
++  }
++  if (carry) emitRecord(carry, 0, carry.length, position - carry.length, onRecord, skipLine);
++}
++
++function emitRecord(buf, start, end, base, onRecord, skipLine) {
++  if (end <= start) return;
++  if (skipLine && skipLine(buf.toString("utf8", start, Math.min(end, start + HEAD_BYTES)))) return;
++  let record;
++  try { record = JSON.parse(buf.toString("utf8", start, end)); } catch { return; }
++  onRecord(record, base + start, base + end);
++}
++
++async function firstByteIs(file, expected) {
++  const buf = Buffer.alloc(4096);
++  for (let position = 0; ;) {
++    const { bytesRead } = await file.read(buf, 0, buf.length, position);
++    if (bytesRead === 0) return false;
++    for (const byte of buf.subarray(0, bytesRead)) {
++      if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
++      return byte === expected;
++    }
++    position += bytesRead;
++  }
++}
++
++// The old whole-file path, kept for single-array transcripts, which are small.
++async function readJsonArray(file) {
++  const content = (await file.readFile()).toString("utf8");
++  try {
++    const data = JSON.parse(content);
++    if (Array.isArray(data)) return data;
++  } catch { /* not a JSON array */ }
++  const records = [];
++  for (const line of content.split("\n")) {
++    if (!line.trim()) continue;
++    try { records.push(JSON.parse(line)); } catch { /* skip */ }
++  }
++  return records;
++}
+diff --git a/scripts/shared/transcript-cursor.mjs b/scripts/shared/transcript-cursor.mjs
+new file mode 100644
+index 00000000..531cb9ba
+--- /dev/null
++++ b/scripts/shared/transcript-cursor.mjs
+@@ -0,0 +1,103 @@
++// GENERATED FROM examples/memory-plugin-shared/lib. DO NOT EDIT.
++/**
++ * Read a transcript's turns from where the last read left off.
++ *
++ * Hosts append to one transcript for a thread's whole life, and every capture
++ * hook used to read it from the top. Past a few GB that runs out of heap: the
++ * hook dies before it can log, and nothing more of the thread is captured.
++ *
++ * Here the transcript is cut at every boundary record (one that starts a turn:
++ * Codex turn_context, a Claude Code prompt) and each turn's records are turned
++ * into turns on their own. Only one turn is held at a time, and the result
++ * carries a cursor — the newest boundary's byte offset and how many turns come
++ * before it — so the next read starts there instead of at byte 0.
++ *
++ * Cutting at every boundary, never by size, makes the turns a function of the
++ * file alone: a read from the top and one resumed at any cursor agree. It also
++ * scopes an extractor's de-duplication to one turn, where reading the whole
++ * file let a record in one turn suppress a repeat in a much later one (a
++ * long-running command's output, recorded under one call id across turns).
++ */
++
++import { findLastHumanTurnIndex } from "./capture-utils.mjs";
++import { forEachJsonlRecord, readBytesAt, readJsonlRecords, startsWithJsonArray } from "./jsonl-file.mjs";
++
++// Bytes of the boundary line a cursor keeps, to recognize it on resume.
++const CURSOR_HEAD_BYTES = 128;
++
++async function cursorStart(path, cursor, keepFrom) {
++  if (
++    cursor?.path !== path
++    || !Number.isSafeInteger(cursor.offset) || cursor.offset <= 0
++    || !Number.isSafeInteger(cursor.turnsBefore) || cursor.turnsBefore < 0
++    // Turns before the cursor are not read again, so it fits only a caller
++    // that needs none of them.
++    || cursor.turnsBefore > keepFrom
++    || typeof cursor.head !== "string"
++  ) return null;
++  const head = await readBytesAt(path, cursor.offset, CURSOR_HEAD_BYTES);
++  return head?.toString("latin1") === cursor.head ? cursor : null;
++}
++
++/**
++ * Resumes at `cursor` (from an earlier result) when the file still has that
++ * boundary there; otherwise reads from the top. Keeps the turns from index
++ * `keepFrom`, and with `keepLast` only that many of the newest.
++ *
++ * - `isBoundary(record)`: the record starts a turn.
++ * - `extractTurns(records, { first })`: the turns of the records from one
++ *   boundary to the next; `first` is true for the records before the first.
++ *
++ * Returns `{ turns, totalTurns, lastHumanTurnIndex, cursor, readFrom }`:
++ * `turns` are the last `turns.length` of `totalTurns`, indexes count the whole
++ * transcript, and `readFrom` is the byte offset this read started at. Throws
++ * when the file cannot be read.
++ */
++export async function readTurnsFromCursor(path, {
++  cursor, keepFrom = 0, keepLast = 0, isBoundary, extractTurns, skipLine,
++}) {
++  const start = await cursorStart(path, cursor, keepFrom);
++  const result = {
++    turns: [], totalTurns: start ? start.turnsBefore : 0, lastHumanTurnIndex: -1, cursor: null,
++    readFrom: start ? start.offset : 0,
++  };
++  let first = !start;
++
++  const flush = (records) => {
++    if (!records.length) return;
++    const turns = extractTurns(records, { first });
++    first = false;
++    const base = result.totalTurns;
++    const human = findLastHumanTurnIndex(turns);
++    if (human >= 0) result.lastHumanTurnIndex = base + human;
++    for (let i = Math.max(0, keepFrom - base); i < turns.length; i += 1) result.turns.push(turns[i]);
++    if (keepLast > 0 && result.turns.length > keepLast) result.turns.splice(0, result.turns.length - keepLast);
++    result.totalTurns += turns.length;
++  };
++
++  // A transcript written as one JSON array (older Claude Code) is read whole.
++  if (!start && await startsWithJsonArray(path)) {
++    flush(await readJsonlRecords(path));
++    return result;
++  }
++
++  let segment = [];
++  let last = null;
++  await forEachJsonlRecord(path, (record, offset) => {
++    if (isBoundary(record)) {
++      flush(segment);
++      segment = [];
++      last = { offset, turnsBefore: result.totalTurns };
++    }
++    segment.push(record);
++  }, { start: result.readFrom, skipLine });
++  flush(segment);
++
++  if (last) {
++    const head = await readBytesAt(path, last.offset, CURSOR_HEAD_BYTES);
++    if (head?.length === CURSOR_HEAD_BYTES) {
++      result.cursor = { path, offset: last.offset, turnsBefore: last.turnsBefore, head: head.toString("latin1") };
++    }
++  }
++  return result;
++}
+diff --git a/scripts/startup-capture.test.mjs b/scripts/startup-capture.test.mjs
+index edbea897..80e0bda4 100644
+--- a/scripts/startup-capture.test.mjs
++++ b/scripts/startup-capture.test.mjs
+@@ -142,4 +142,47 @@ test("shortened transcript resumes at the latest human turn", async () => {
+   assert.equal(state.capturedTurnCount, 2);
+ });
+ 
++test("a grown rollout is read from the saved turn_context, not from the top", async () => {
++  const id = "cursor";
++  const sent = [];
++  const earlier = rollout(message("user", "First question"), message("assistant", "First answer"));
++  const turn2 = [
++    { type: "turn_context", payload: { turn_id: "turn-2", cwd: "/tmp/project" } },
++    message("user", "Second question"), message("assistant", "Second answer"),
++  ];
++  const path = await writeRollout(id, [...earlier, ...turn2]);
++  const first = await catchUp(id, path, sent);
++  assert.equal(first.result.added, 4);
++  const content = await readFile(path, "utf-8");
++  const offset = Buffer.byteLength(content.slice(0, content.indexOf('{"type":"turn_context","payload":{"turn_id":"turn-2"')));
++  assert.equal(first.state.transcriptCursor.offset, offset);
++  assert.equal(first.state.transcriptCursor.turnsBefore, 2);
++
++  // Blank out everything before the cursor: only a resumed read still finds
++  // the earlier turns where the cursor says they end.
++  await writeRollout(id, [...turn2, message("user", "Third question")]);
++  await writeFile(path, " ".repeat(offset - 1) + "\n" + (await readFile(path, "utf-8")));
++  const second = await catchUp(id, path, sent);
++  assert.equal(second.result.added, 1);
++  assert.deepEqual(sent.map((item) => item.parts[0].text),
++    ["First question", "First answer", "Second question", "Second answer", "Third question"]);
++  assert.equal(second.state.capturedTurnCount, 5);
++});
++
++test("the saved cursor never moves past a turn that failed to send", async () => {
++  const id = "cursor-failure";
++  const sent = [];
++  const path = await writeRollout(id, rollout(
++    message("user", "Retry me"),
++    { type: "turn_context", payload: { turn_id: "turn-2", cwd: "/tmp/project" } },
++    message("user", "And me"), message("assistant", "with a long enough tail for the cursor head"),
++  ));
++  const failed = await catchUp(id, path, sent, { fail: true });
++  assert.equal(failed.result.added, 0);
++  assert.equal((await loadState(id)).transcriptCursor, undefined);
++  assert.equal((await catchUp(id, path, sent)).result.added, 3);
++  assert.deepEqual(sent.map((item) => item.parts[0].text),
++    ["Retry me", "And me", "with a long enough tail for the cursor head"]);
++});
++
+ test.after(async () => { await rm(stateDir, { recursive: true, force: true }); });

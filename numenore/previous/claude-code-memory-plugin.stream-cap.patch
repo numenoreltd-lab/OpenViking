@@ -1,0 +1,205 @@
+diff --git a/scripts/auto-capture.mjs b/scripts/auto-capture.mjs
+index 7bb81b50..a8c75c41 100644
+--- a/scripts/auto-capture.mjs
++++ b/scripts/auto-capture.mjs
+@@ -24,7 +24,7 @@ import { join } from "node:path";
+ import { tmpdir } from "node:os";
+ import { isPluginEnabled, loadConfig } from "./config.mjs";
+ import { createLogger } from "./debug-log.mjs";
+-import { extractCaptureTurns, parseTranscript, sanitizeCapturedText } from "./cc-transcript.mjs";
++import { extractCaptureTurns, sanitizeCapturedText } from "./cc-transcript.mjs";
+ import {
+   commitSession,
+   deriveOvSessionId,
+@@ -39,6 +39,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
+ import { runHookStage } from "./shared/agent-hook-runtime.mjs";
+ import { sendSessionMessages } from "./shared/batch-send.mjs";
+ import { shapeCaptureParts } from "./shared/capture-utils.mjs";
++import { readJsonlRecords } from "./shared/jsonl-file.mjs";
+ 
+ if (!isPluginEnabled()) {
+   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
+@@ -223,20 +224,19 @@ async function main({ cfg, input, cwd }) {
+     return;
+   }
+ 
+-  let transcriptContent;
++  let messages;
+   try {
+-    transcriptContent = await readFile(transcriptPath, "utf-8");
++    messages = await readJsonlRecords(transcriptPath);
+   } catch (err) {
+     logError("transcript_read", err);
+     return;
+   }
+ 
+-  if (!transcriptContent.trim()) {
++  if (messages.length === 0) {
+     log("skip", { stage: "transcript_read", reason: "empty transcript" });
+     return;
+   }
+ 
+-  const messages = parseTranscript(transcriptContent);
+   const allTurns = extractCaptureTurns(messages, cfg);
+   if (allTurns.length === 0) {
+     log("skip", { stage: "transcript_parse", reason: "no user/assistant turns found" });
+@@ -245,6 +245,15 @@ async function main({ cfg, input, cwd }) {
+ 
+   const state = await loadState(sessionId);
+   await reconcileKnownFailedCapture(cfg, sessionId, ovSessionId, state);
++  const maxCatchUp = Number(cfg.captureCatchUpMaxTurns) || 0;
++  if (maxCatchUp > 0 && allTurns.length - state.capturedTurnCount > maxCatchUp) {
++    log("catch_up_capped", {
++      previouslyCaptured: state.capturedTurnCount,
++      skipped: allTurns.length - maxCatchUp - state.capturedTurnCount,
++      kept: maxCatchUp,
++    });
++    state.capturedTurnCount = allTurns.length - maxCatchUp;
++  }
+   const newTurns = allTurns.slice(state.capturedTurnCount);
+   const captureTurns = cfg.captureAssistantTurns
+     ? newTurns
+diff --git a/scripts/shared/config-schema.mjs b/scripts/shared/config-schema.mjs
+index c79d4f11..da67e999 100644
+--- a/scripts/shared/config-schema.mjs
++++ b/scripts/shared/config-schema.mjs
+@@ -152,6 +152,9 @@ export const KNOBS = [
+   { name: "captureTimeoutMs", type: "int", default: 0, min: 0, max: 600000, env: "OPENVIKING_CAPTURE_TIMEOUT_MS", capability: "capture" },
+   { name: "commitTokenThreshold", type: "int", default: 20000, min: 1000, max: 1000000, env: "OPENVIKING_COMMIT_TOKEN_THRESHOLD", workspace: "capture.commit_token_threshold", capability: "capture" },
+   { name: "commitKeepRecentCount", type: "int", default: 10, min: 0, max: 1000, env: "OPENVIKING_COMMIT_KEEP_RECENT_COUNT", capability: "capture" },
++  // 0 sends every turn past the cursor. A cursor far behind (lost state, a long outage, a transcript that was
++  // unreadable for days) otherwise replays that whole backlog in one commit, beyond what extraction can take.
++  { name: "captureCatchUpMaxTurns", type: "int", default: 0, min: 0, max: 1000000, env: "OPENVIKING_CAPTURE_CATCH_UP_MAX_TURNS", capability: "capture" },
+   { name: "commitTurnThreshold", type: "int", default: 8, min: 1, max: 1000, env: "OPENVIKING_COMMIT_TURN_THRESHOLD", capability: "capture" },
+   { name: "autoCommitOnCompact", type: "bool", default: true, env: "OPENVIKING_AUTO_COMMIT_ON_COMPACT", capability: "capture" },
+   { name: "writePathAsync", type: "bool", default: true, env: "OPENVIKING_WRITE_PATH_ASYNC", capability: "capture" },
+diff --git a/scripts/shared/jsonl-file.mjs b/scripts/shared/jsonl-file.mjs
+new file mode 100644
+index 00000000..3ad30de2
+--- /dev/null
++++ b/scripts/shared/jsonl-file.mjs
+@@ -0,0 +1,85 @@
++// GENERATED FROM examples/memory-plugin-shared/lib. DO NOT EDIT.
++/**
++ * Read a JSONL transcript record by record.
++ *
++ * Hosts append to one transcript for the whole life of a thread, and a long
++ * one passes V8's string limit (~512 MB): `readFile(path, "utf-8")` then throws
++ * `Invalid string length` on every hook, and nothing more of that thread is
++ * captured. Reading in chunks and decoding one line at a time keeps memory to
++ * what the records themselves take.
++ *
++ * `skipLine(head)` sees the first bytes of a line and can drop it before it is
++ * parsed — for record types a caller never reads, which in a long Codex rollout
++ * are most of the file.
++ *
++ * Returns what `content.split("\n").map(JSON.parse)` would, skipping blank and
++ * unparseable lines. A file that is one JSON array (older Claude transcripts)
++ * is read whole, as before.
++ */
++
++import { open } from "node:fs/promises";
++
++const CHUNK_BYTES = 16 * 1024 * 1024;
++const HEAD_BYTES = 256;
++const NEWLINE = 0x0a;
++
++export async function readJsonlRecords(path, { skipLine, chunkBytes = CHUNK_BYTES } = {}) {
++  const file = await open(path, "r");
++  try {
++    if (await firstByteIs(file, 0x5b /* "[" */)) return await readJsonArray(file);
++    const records = [];
++    const chunk = Buffer.alloc(chunkBytes);
++    let carry = null;
++    let position = 0;
++    for (;;) {
++      const { bytesRead } = await file.read(chunk, 0, chunk.length, position);
++      if (bytesRead === 0) break;
++      position += bytesRead;
++      const buf = carry ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead);
++      let start = 0;
++      for (let nl = buf.indexOf(NEWLINE); nl !== -1; nl = buf.indexOf(NEWLINE, start)) {
++        pushRecord(records, buf, start, nl, skipLine);
++        start = nl + 1;
++      }
++      carry = start < buf.length ? Buffer.from(buf.subarray(start)) : null;
++    }
++    if (carry) pushRecord(records, carry, 0, carry.length, skipLine);
++    return records;
++  } finally {
++    await file.close();
++  }
++}
++
++function pushRecord(records, buf, start, end, skipLine) {
++  if (end <= start) return;
++  if (skipLine && skipLine(buf.toString("utf8", start, Math.min(end, start + HEAD_BYTES)))) return;
++  try { records.push(JSON.parse(buf.toString("utf8", start, end))); } catch { /* skip */ }
++}
++
++async function firstByteIs(file, expected) {
++  const buf = Buffer.alloc(4096);
++  for (let position = 0; ;) {
++    const { bytesRead } = await file.read(buf, 0, buf.length, position);
++    if (bytesRead === 0) return false;
++    for (const byte of buf.subarray(0, bytesRead)) {
++      if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
++      return byte === expected;
++    }
++    position += bytesRead;
++  }
++}
++
++// The old whole-file path, kept for single-array transcripts, which are small.
++async function readJsonArray(file) {
++  const content = (await file.readFile()).toString("utf8");
++  try {
++    const data = JSON.parse(content);
++    if (Array.isArray(data)) return data;
++  } catch { /* not a JSON array */ }
++  const records = [];
++  for (const line of content.split("\n")) {
++    if (!line.trim()) continue;
++    try { records.push(JSON.parse(line)); } catch { /* skip */ }
++  }
++  return records;
++}
+diff --git a/scripts/subagent-stop.mjs b/scripts/subagent-stop.mjs
+index 2a20d8f9..dc07b002 100644
+--- a/scripts/subagent-stop.mjs
++++ b/scripts/subagent-stop.mjs
+@@ -21,7 +21,7 @@ import { join } from "node:path";
+ import { tmpdir } from "node:os";
+ import { isPluginEnabled, loadConfig } from "./config.mjs";
+ import { createLogger } from "./debug-log.mjs";
+-import { extractCaptureTurns, parseTranscript } from "./cc-transcript.mjs";
++import { extractCaptureTurns } from "./cc-transcript.mjs";
+ import {
+   commitSession,
+   deriveOvSessionId,
+@@ -34,6 +34,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
+ import { runHookStage } from "./shared/agent-hook-runtime.mjs";
+ import { sendSessionMessages } from "./shared/batch-send.mjs";
+ import { shapeCaptureParts } from "./shared/capture-utils.mjs";
++import { readJsonlRecords } from "./shared/jsonl-file.mjs";
+ 
+ if (!isPluginEnabled()) {
+   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
+@@ -161,15 +162,14 @@ async function main() {
+     const state = await loadState(subagentId);
+     const ovSessionId = state?.ovSessionId || deriveOvSessionId(sessionId, `subagent:${subagentId}`);
+ 
+-    let transcript;
++    let messages;
+     try {
+-      transcript = await readFile(transcriptPath, "utf-8");
++      messages = await readJsonlRecords(transcriptPath);
+     } catch (err) {
+       logError("transcript_read", err);
+       return;
+     }
+ 
+-    const messages = parseTranscript(transcript);
+     const turns = extractCaptureTurns(messages, cfg);
+     log("transcript_parse", {
+       subagentId,
