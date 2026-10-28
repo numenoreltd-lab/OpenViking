@@ -1,5 +1,5 @@
 diff --git a/scripts/auto-capture.mjs b/scripts/auto-capture.mjs
-index 7bb81b50..ba0b6e9f 100644
+index 8be33ec0..441292d0 100644
 --- a/scripts/auto-capture.mjs
 +++ b/scripts/auto-capture.mjs
 @@ -13,7 +13,8 @@
@@ -21,7 +21,7 @@ index 7bb81b50..ba0b6e9f 100644
  import {
    commitSession,
    deriveOvSessionId,
-@@ -39,6 +40,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
+@@ -40,6 +41,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
  import { runHookStage } from "./shared/agent-hook-runtime.mjs";
  import { sendSessionMessages } from "./shared/batch-send.mjs";
  import { shapeCaptureParts } from "./shared/capture-utils.mjs";
@@ -29,7 +29,7 @@ index 7bb81b50..ba0b6e9f 100644
  
  if (!isPluginEnabled()) {
    process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
-@@ -223,34 +225,48 @@ async function main({ cfg, input, cwd }) {
+@@ -224,34 +226,48 @@ async function main({ cfg, input, cwd }) {
      return;
    }
  
@@ -92,7 +92,7 @@ index 7bb81b50..ba0b6e9f 100644
      previouslyCaptured: state.capturedTurnCount,
      newTurns: newTurns.length,
      captureTurns: captureTurns.length,
-@@ -263,11 +279,8 @@ async function main({ cfg, input, cwd }) {
+@@ -264,11 +280,8 @@ async function main({ cfg, input, cwd }) {
    }
  
    if (captureTurns.length === 0) {
@@ -106,7 +106,7 @@ index 7bb81b50..ba0b6e9f 100644
      return;
    }
  
-@@ -285,10 +298,7 @@ async function main({ cfg, input, cwd }) {
+@@ -286,10 +299,7 @@ async function main({ cfg, input, cwd }) {
    const combined = formatTurnsAsText(captureTurns);
    if (!sanitizeCapturedText(combined)) {
      log("skip", { stage: "batch_empty" });
@@ -118,7 +118,7 @@ index 7bb81b50..ba0b6e9f 100644
      return;
    }
  
-@@ -300,10 +310,7 @@ async function main({ cfg, input, cwd }) {
+@@ -301,10 +311,7 @@ async function main({ cfg, input, cwd }) {
      );
      if (!hasTrigger) {
        log("skip", { stage: "keyword_mode_no_trigger", turns: captureTurns.length });
@@ -130,7 +130,7 @@ index 7bb81b50..ba0b6e9f 100644
        return;
      }
    }
-@@ -331,11 +338,8 @@ async function main({ cfg, input, cwd }) {
+@@ -339,11 +346,8 @@ async function main({ cfg, input, cwd }) {
        logError("pending_enqueue", "some turns failed to enqueue; state not advanced");
        return;
      }
@@ -144,7 +144,7 @@ index 7bb81b50..ba0b6e9f 100644
      writeJsonState("last-capture.json", {
        turns_captured: 0,
        turns_queued: result.queued,
-@@ -389,11 +393,8 @@ async function main({ cfg, input, cwd }) {
+@@ -397,11 +401,8 @@ async function main({ cfg, input, cwd }) {
    // A missing live-message file is recoverable after the server is fixed, so
    // retain the cursor for that failure. Other non-retryable 4xx responses keep
    // the historical terminal behavior instead of retrying invalid payloads.
@@ -159,10 +159,10 @@ index 7bb81b50..ba0b6e9f 100644
    // Client-driven commit (ported from openclaw-plugin/context-engine.ts:afterTurn).
    // OV's Session._auto_commit_threshold is not consumed by addMessage, so we
 diff --git a/scripts/auto-capture.test.mjs b/scripts/auto-capture.test.mjs
-index 7b55d917..9e96e3fe 100644
+index 24fee44c..af8f058b 100644
 --- a/scripts/auto-capture.test.mjs
 +++ b/scripts/auto-capture.test.mjs
-@@ -126,6 +126,60 @@ test("failed non-retryable capture keeps the cursor for a later retry", async ()
+@@ -184,6 +184,60 @@ test("Stop replays queued writes before sending the new turns", async () => {
    }
  });
  
@@ -224,10 +224,10 @@ index 7b55d917..9e96e3fe 100644
    const root = await mkdtemp(join(tmpdir(), "ov-cc-capture-commit-"));
    const transcriptPath = join(root, "transcript.jsonl");
 diff --git a/scripts/cc-transcript.mjs b/scripts/cc-transcript.mjs
-index 251c346a..6eb4a3ce 100644
+index 9fa53760..170de0b5 100644
 --- a/scripts/cc-transcript.mjs
 +++ b/scripts/cc-transcript.mjs
-@@ -123,6 +123,18 @@ function textFromParts(parts) {
+@@ -127,6 +127,18 @@ function textFromParts(parts) {
    return chunks.join("\n\n").trim();
  }
  
@@ -247,10 +247,10 @@ index 251c346a..6eb4a3ce 100644
   * Every user/assistant turn in the transcript, in order.
   *
 diff --git a/scripts/shared/config-schema.mjs b/scripts/shared/config-schema.mjs
-index c79d4f11..da67e999 100644
+index aec305ae..61af7ab0 100644
 --- a/scripts/shared/config-schema.mjs
 +++ b/scripts/shared/config-schema.mjs
-@@ -152,6 +152,9 @@ export const KNOBS = [
+@@ -155,6 +155,9 @@ export const KNOBS = [
    { name: "captureTimeoutMs", type: "int", default: 0, min: 0, max: 600000, env: "OPENVIKING_CAPTURE_TIMEOUT_MS", capability: "capture" },
    { name: "commitTokenThreshold", type: "int", default: 20000, min: 1000, max: 1000000, env: "OPENVIKING_COMMIT_TOKEN_THRESHOLD", workspace: "capture.commit_token_threshold", capability: "capture" },
    { name: "commitKeepRecentCount", type: "int", default: 10, min: 0, max: 1000, env: "OPENVIKING_COMMIT_KEEP_RECENT_COUNT", capability: "capture" },
@@ -509,10 +509,10 @@ index 00000000..531cb9ba
 +  return result;
 +}
 diff --git a/scripts/subagent-stop.mjs b/scripts/subagent-stop.mjs
-index 2a20d8f9..dc07b002 100644
+index 23f11d07..ca519896 100644
 --- a/scripts/subagent-stop.mjs
 +++ b/scripts/subagent-stop.mjs
-@@ -21,7 +21,7 @@ import { join } from "node:path";
+@@ -26,7 +26,7 @@ import { join } from "node:path";
  import { tmpdir } from "node:os";
  import { isPluginEnabled, loadConfig } from "./config.mjs";
  import { createLogger } from "./debug-log.mjs";
@@ -521,7 +521,7 @@ index 2a20d8f9..dc07b002 100644
  import {
    commitSession,
    deriveOvSessionId,
-@@ -34,6 +34,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
+@@ -39,6 +39,7 @@ import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
  import { runHookStage } from "./shared/agent-hook-runtime.mjs";
  import { sendSessionMessages } from "./shared/batch-send.mjs";
  import { shapeCaptureParts } from "./shared/capture-utils.mjs";
@@ -529,7 +529,7 @@ index 2a20d8f9..dc07b002 100644
  
  if (!isPluginEnabled()) {
    process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
-@@ -161,15 +162,14 @@ async function main() {
+@@ -175,15 +176,14 @@ async function main() {
      const state = await loadState(subagentId);
      const ovSessionId = state?.ovSessionId || deriveOvSessionId(sessionId, `subagent:${subagentId}`);
  
@@ -545,5 +545,5 @@ index 2a20d8f9..dc07b002 100644
  
 -    const messages = parseTranscript(transcript);
      const turns = extractCaptureTurns(messages, cfg);
-     log("transcript_parse", {
-       subagentId,
+     const capturedTurnCount = state?.capturedTurnCount || 0;
+     const newTurns = turns.slice(capturedTurnCount);

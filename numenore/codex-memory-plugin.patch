@@ -198,10 +198,10 @@ index e762c944..2736ddf3 100644
        await heartbeat?.();
      },
 diff --git a/scripts/shared/config-schema.mjs b/scripts/shared/config-schema.mjs
-index c79d4f11..da67e999 100644
+index aec305ae..61af7ab0 100644
 --- a/scripts/shared/config-schema.mjs
 +++ b/scripts/shared/config-schema.mjs
-@@ -152,6 +152,9 @@ export const KNOBS = [
+@@ -155,6 +155,9 @@ export const KNOBS = [
    { name: "captureTimeoutMs", type: "int", default: 0, min: 0, max: 600000, env: "OPENVIKING_CAPTURE_TIMEOUT_MS", capability: "capture" },
    { name: "commitTokenThreshold", type: "int", default: 20000, min: 1000, max: 1000000, env: "OPENVIKING_COMMIT_TOKEN_THRESHOLD", workspace: "capture.commit_token_threshold", capability: "capture" },
    { name: "commitKeepRecentCount", type: "int", default: 10, min: 0, max: 1000, env: "OPENVIKING_COMMIT_KEEP_RECENT_COUNT", capability: "capture" },
